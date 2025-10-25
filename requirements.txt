@@ -1,0 +1,4 @@
+fastapi
+uvicorn
+cloudinary
+yt-dlp
