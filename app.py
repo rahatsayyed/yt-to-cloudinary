@@ -1,6 +1,9 @@
 from fastapi import FastAPI, Request
-import subprocess, os, glob
+import subprocess, os, glob, json
 import cloudinary, cloudinary.uploader
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from datetime import datetime
 import yt_dlp
 
 app = FastAPI()
@@ -12,6 +15,18 @@ cloudinary.config(
     api_secret=os.getenv("CLOUDINARY_API_SECRET")
 )
 
+# --- Google Sheets Setup ---
+SERVICE_JSON = os.getenv("GOOGLE_SERVICE_JSON")
+SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+credentials = service_account.Credentials.from_service_account_info(
+    json.loads(SERVICE_JSON),
+    scopes=SCOPES
+)
+service = build('sheets', 'v4', credentials=credentials)
+sheet = service.spreadsheets()
+
 @app.post("/process")
 async def process_video(request: Request):
     data = await request.json()
@@ -21,20 +36,16 @@ async def process_video(request: Request):
         return {"error": "Missing video_url"}
 
     try:
-        # --- Extract video info using yt-dlp ---
-        ydl_opts_info = {}
-        with yt_dlp.YoutubeDL(ydl_opts_info) as ydl:
+        # --- Extract video info ---
+        with yt_dlp.YoutubeDL({}) as ydl:
             info = ydl.extract_info(video_url, download=False)
 
-        video_title = info.get("title", "video")
-        video_description = info.get("description", "")
-        video_uploader = info.get("uploader", "")
-        video_uploader_url = info.get("uploader_url", "")
-        video_webpage_url = info.get("webpage_url", "")
-        video_duration = info.get("duration", 0)
-        video_thumbnail = info.get("thumbnail", "")
+        title = info.get("title", "video")
+        description = info.get("description", "")
+        thumbnail = info.get("thumbnail", "")
+        tags = ",".join(info.get("tags", []))
 
-        # --- Download using yt-dlp ---
+        # --- Download video ---
         subprocess.run([
             "yt-dlp",
             "-f", "bestvideo+bestaudio",
@@ -43,46 +54,55 @@ async def process_video(request: Request):
             video_url
         ], check=True)
 
-        # --- Find the downloaded file ---
         files = glob.glob("*.mp4")
         if not files:
             return {"error": "Download failed, no MP4 file found."}
 
         output_path = files[0]
 
-        # --- Upload to Cloudinary using custom_metadata ---
+        # --- Upload to Cloudinary ---
         upload_result = cloudinary.uploader.upload(
             output_path,
-            resource_type="video",
-            custom_metadata={
-                "original_title": video_title,
-                "caption": video_description,
-                "uploader": video_uploader,
-                "uploader_url": video_uploader_url,
-                "original_video_url": video_webpage_url,
-                "thumbnail": video_thumbnail,
-                "duration": str(video_duration)  # must be string
-            }
+            resource_type="video"
         )
+        cloudinary_url = upload_result["secure_url"]
 
-        # --- Clean up local file ---
+        # --- Prepare row for Google Sheets ---
+        timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        row_data = [
+            timestamp,               # Timestamp
+            video_url,               # YouTube Video URL
+            cloudinary_url,          # Cloudinary URL
+            title,                   # Title
+            description,             # Description
+            thumbnail,               # Thumbnail URL
+            tags,                    # Tags
+            "",                      # Instagram Caption (empty for now)
+            "",                      # Published At (empty)
+            "",                      # Creation ID (empty)
+            ""                       # Error (empty)
+        ]
+
+        sheet.values().append(
+            spreadsheetId=SHEET_ID,
+            range="Sheet1!A1",  # adjust if your sheet has a different name
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [row_data]}
+        ).execute()
+
+        # --- Cleanup ---
         os.remove(output_path)
 
         return {
-            "cloudinary_url": upload_result["secure_url"],
-            "file_name": os.path.basename(output_path),
+            "cloudinary_url": cloudinary_url,
             "metadata": {
-                "original_title": video_title,
-                "caption": video_description,
-                "uploader": video_uploader,
-                "uploader_url": video_uploader_url,
-                "original_video_url": video_webpage_url,
-                "thumbnail": video_thumbnail,
-                "duration": video_duration
+                "title": title,
+                "description": description,
+                "thumbnail": thumbnail,
+                "tags": tags
             }
         }
 
-    except subprocess.CalledProcessError as e:
-        return {"error": f"Download failed: {str(e)}"}
     except Exception as e:
         return {"error": str(e)}
