@@ -27,6 +27,28 @@ credentials = service_account.Credentials.from_service_account_info(
 service = build('sheets', 'v4', credentials=credentials)
 sheet = service.spreadsheets()
 
+@app.get("/")
+async def root():
+    return {
+        "message": "YouTube to Cloudinary API is running",
+        "endpoints": ["/process", "/health"]
+    }
+
+@app.get("/health")
+async def health():
+    # Check if Google Sheets and Cloudinary credentials exist
+    google_ok = SERVICE_JSON is not None and SHEET_ID is not None
+    cloudinary_ok = all([
+        os.getenv("CLOUDINARY_CLOUD_NAME"),
+        os.getenv("CLOUDINARY_API_KEY"),
+        os.getenv("CLOUDINARY_API_SECRET")
+    ])
+    return {
+        "status": "ok" if google_ok and cloudinary_ok else "error",
+        "google_sheets_configured": google_ok,
+        "cloudinary_configured": cloudinary_ok
+    }
+
 @app.post("/process")
 async def process_video(request: Request):
     data = await request.json()
