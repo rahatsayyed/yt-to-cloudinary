@@ -84,7 +84,7 @@ def ensure_sheet_exists(sheet_name):
         meta = sheet.get(spreadsheetId=SHEET_ID).execute()
         existing = [s["properties"]["title"] for s in meta.get("sheets", [])]
         headers = [["Timestamp","YouTube URL","Cloudinary URL","Title","Description",
-                    "Thumbnail","Tags","Instagram Caption","Published At","Creation ID","Error"]]
+                    "Thumbnail","Tags","Instagram Caption","Published At (IG)","Creation ID","Error"]]
 
         if sheet_name not in existing:
             sheet.batchUpdate(
@@ -161,9 +161,14 @@ def process_video(video_url: str, category: str = "manual"):
         published_at = info.get("upload_date", "")
         duration = info.get("duration", 0)
 
-        # --- Skip non-Shorts ---
-        if duration > 65:
-            raise RuntimeError(f"Video too long ({duration}s) — not a Short")
+        # --- Skip non-Shorts (Instagram Reels max: 90 seconds) ---
+        if duration > 90:
+            log_event(logging.WARNING, "SKIP", f"Video too long ({duration}s) — Instagram Reels max is 90s")
+            raise RuntimeError(f"Video too long ({duration}s) — Instagram Reels limit is 90 seconds")
+        
+        if duration < 3:
+            log_event(logging.WARNING, "SKIP", f"Video too short ({duration}s) — minimum is 3s")
+            raise RuntimeError(f"Video too short ({duration}s) — minimum length is 3 seconds")
 
         # --- Download Video with retries and better error handling ---
         out_template = os.path.join(save_dir, f"{video_id}.%(ext)s")
@@ -216,9 +221,17 @@ def process_video(video_url: str, category: str = "manual"):
 
         # --- Append to Sheet ---
         row = [
-            datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-            video_url, cloud_url, title, description, thumbnail, tags, "",
-            published_at, "", ""
+            datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),  # Timestamp
+            video_url,           # YouTube URL
+            cloud_url,           # Cloudinary URL
+            title,               # Title
+            description,         # Description
+            thumbnail,           # Thumbnail
+            tags,                # Tags
+            "",                  # Instagram Caption (empty - to be filled manually)
+            "",                  # Published At (IG) (empty - for when posted to Instagram)
+            "",                  # Creation ID (empty - for Instagram API response)
+            ""                   # Error (empty on success)
         ]
         append_row(category, row)
         log_event(logging.INFO, "SUCCESS", f"{title} → {cloud_url}")
@@ -227,8 +240,17 @@ def process_video(video_url: str, category: str = "manual"):
     except Exception as e:
         log_event(logging.ERROR, "ERROR", f"Failed {video_url}: {e}")
         append_row(category, [
-            datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-            video_url, "", "", "", "", "", "", "", "", str(e)
+            datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),  # Timestamp
+            video_url,           # YouTube URL
+            "",                  # Cloudinary URL (empty on error)
+            "",                  # Title (empty)
+            "",                  # Description (empty)
+            "",                  # Thumbnail (empty)
+            "",                  # Tags (empty)
+            "",                  # Instagram Caption (empty)
+            "",                  # Published At (IG) (empty)
+            "",                  # Creation ID (empty)
+            str(e)               # Error message
         ])
         try:
             if temp_filename and os.path.exists(temp_filename):
