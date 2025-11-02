@@ -134,13 +134,10 @@ def process_video(video_url: str, category: str = "manual"):
     """Download, upload to Cloudinary, and log to Google Sheet."""
     log_event(logging.INFO, "PROCESS", f"{category.upper()} processing started for {video_url}")
     ensure_sheet_exists(category)
-
     temp_filename = None
     save_dir = os.path.join(VIDEO_ROOT, category)
     os.makedirs(save_dir, exist_ok=True)
-
     has_cookies = validate_cookies_file()
-
     try:
         # --- Extract metadata ---
         ydl_opts = {
@@ -149,23 +146,20 @@ def process_video(video_url: str, category: str = "manual"):
         }
         if has_cookies:
             ydl_opts["cookiefile"] = COOKIES_PATH
-
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(video_url, download=False)
-
-        video_id = info.get("id")
-        title = info.get("title", "video")
-        description = info.get("description", "")
-        thumbnail = info.get("thumbnail", "")
-        tags = ",".join(info.get("tags", []))
-        published_at = info.get("upload_date", "")
-        duration = info.get("duration", 0)
-
+            video_id = info.get("id")
+            title = info.get("title", "video")
+            description = info.get("description", "")
+            thumbnail = info.get("thumbnail", "")
+            tags = ",".join(info.get("tags", []))
+            published_at = info.get("upload_date", "")
+            duration = info.get("duration", 0)
+        
         # --- Skip non-Shorts (Instagram Reels max: 90 seconds) ---
         if duration > 90:
             log_event(logging.WARNING, "SKIP", f"Video too long ({duration}s) — Instagram Reels max is 90s")
             raise RuntimeError(f"Video too long ({duration}s) — Instagram Reels limit is 90 seconds")
-        
         if duration < 3:
             log_event(logging.WARNING, "SKIP", f"Video too short ({duration}s) — minimum is 3s")
             raise RuntimeError(f"Video too short ({duration}s) — minimum length is 3 seconds")
@@ -175,90 +169,140 @@ def process_video(video_url: str, category: str = "manual"):
         log_event(logging.INFO, "DOWNLOAD", f"Downloading {video_id} ({title})")
 
         download_opts = {
-            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "format": "bv*[ext=mp4][vcodec^=avc1]+ba[ext=m4a]/b[ext=mp4][vcodec^=avc1]/bv*+ba/b",
             "merge_output_format": "mp4",
             "outtmpl": out_template,
             "quiet": False,
             "no_warnings": False,
             "retries": 10,
             "fragment_retries": 10,
-            "skip_unavailable_fragments": True,
+            "skip_unavailable_fragments": False,  # Don't skip fragments - we need complete video
             "keepvideo": False,
-            "http_chunk_size": 10485760,  # 10MB chunks for better stability
+            "http_chunk_size": 10485760,
             "extractor_retries": 3,
             "file_access_retries": 3,
-            "concurrent_fragment_downloads": 1,  # Avoid overwhelming network
+            "concurrent_fragment_downloads": 1,
+            "postprocessors": [{
+                "key": "FFmpegVideoConvertor",
+                "preferedformat": "mp4",
+            }],
+            "prefer_ffmpeg": True,
+            "fixup": "detect_or_warn",  # Auto-fix container issues
         }
         if has_cookies:
             download_opts["cookiefile"] = COOKIES_PATH
-
         with yt_dlp.YoutubeDL(download_opts) as ydl:
             ydl.download([video_url])
-
+        
         # --- Find the downloaded file ---
         possible = [f for f in os.listdir(save_dir) if f.startswith(video_id + ".")]
         if not possible:
             raise FileNotFoundError(f"Downloaded file for {video_id} not found")
         mp4_files = [p for p in possible if p.lower().endswith(".mp4")]
         temp_filename = os.path.join(save_dir, mp4_files[0] if mp4_files else possible[0])
-
+        
+        # --- NEW: Fix MP4 Container with FFmpeg ---
+        fixed_filename = None
+        try:
+            if temp_filename.lower().endswith('.mp4'):
+                # First, try fast remux to fix timestamps/container
+                fixed_filename = temp_filename.replace('.mp4', '_fixed.mp4')
+                cmd = [
+                    'ffmpeg', '-y', '-i', temp_filename,
+                    '-c', 'copy',  # Copy streams (no re-encode for speed)
+                    '-movflags', '+faststart',  # Optimize for web streaming
+                    '-fflags', '+genpts',  # Generate missing PTS
+                    fixed_filename
+                ]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                if result.returncode != 0:
+                    log_event(logging.WARNING, "FFMPEG", f"Remux failed: {result.stderr}. Falling back to re-encode.")
+                    # Fallback: Full re-encode if remux fails
+                    fixed_filename = temp_filename.replace('.mp4', '_reencoded.mp4')
+                    cmd = [
+                        'ffmpeg', '-y', '-i', temp_filename,
+                        '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',  # H.264, good quality/speed
+                        '-c:a', 'aac', '-b:a', '128k',  # AAC audio
+                        '-movflags', '+faststart',
+                        '-fflags', '+genpts',
+                        fixed_filename
+                    ]
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                    if result.returncode != 0:
+                        raise RuntimeError(f"FFmpeg re-encode failed: {result.stderr}")
+                
+                # Replace temp with fixed file
+                os.remove(temp_filename)
+                temp_filename = fixed_filename
+                log_event(logging.INFO, "FFMPEG", f"Fixed MP4 container for {os.path.basename(temp_filename)}")
+            else:
+                log_event(logging.WARNING, "FFMPEG", f"Skipping fix: File is not MP4 ({os.path.splitext(temp_filename)[1]})")
+        except Exception as e:
+            log_event(logging.ERROR, "FFMPEG", f"Failed to fix MP4: {e}")
+            if fixed_filename and os.path.exists(fixed_filename):
+                os.remove(fixed_filename)
+            # Continue with original if fix fails
+        
         # --- Upload to Cloudinary ---
         log_event(logging.INFO, "UPLOAD", f"Uploading file {temp_filename} to Cloudinary")
         upload_result = cloudinary.uploader.upload(
             temp_filename,
             resource_type="video",
             timeout=300,  # 5 minute timeout for large files
-            chunk_size=6000000  # 6MB chunks
+            chunk_size=6000000,  # 6MB chunks
+            format="mp4"  # Force MP4 format hint
         )
         cloud_url = upload_result.get("secure_url")
-
+        
         # --- Cleanup ---
         try:
             os.remove(temp_filename)
-            log_event(logging.INFO, "CLEANUP", f"Deleted local file {temp_filename}")
+            if fixed_filename and fixed_filename != temp_filename and os.path.exists(fixed_filename):
+                os.remove(fixed_filename)
+            log_event(logging.INFO, "CLEANUP", f"Deleted local file(s) for {video_id}")
         except Exception as e_rm:
-            log_event(logging.WARNING, "CLEANUP", f"Failed to remove temp file {temp_filename}: {e_rm}")
-
+            log_event(logging.WARNING, "CLEANUP", f"Failed to remove temp file(s): {e_rm}")
+        
         # --- Append to Sheet ---
         row = [
             datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),  # Timestamp
-            video_url,           # YouTube URL
-            cloud_url,           # Cloudinary URL
-            title,               # Title
-            description,         # Description
-            thumbnail,           # Thumbnail
-            tags,                # Tags
-            "",                  # Instagram Caption (empty - to be filled manually)
-            "",                  # Published At (IG) (empty - for when posted to Instagram)
-            "",                  # Creation ID (empty - for Instagram API response)
-            ""                   # Error (empty on success)
+            video_url,  # YouTube URL
+            cloud_url,  # Cloudinary URL
+            title,  # Title
+            description,  # Description
+            thumbnail,  # Thumbnail
+            tags,  # Tags
+            "",  # Instagram Caption (empty - to be filled manually)
+            "",  # Published At (IG) (empty - for when posted to Instagram)
+            "",  # Creation ID (empty - for Instagram API response)
+            ""  # Error (empty on success)
         ]
         append_row(category, row)
         log_event(logging.INFO, "SUCCESS", f"{title} → {cloud_url}")
         return {"status": "success", "url": cloud_url}
-
     except Exception as e:
         log_event(logging.ERROR, "ERROR", f"Failed {video_url}: {e}")
         append_row(category, [
             datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),  # Timestamp
-            video_url,           # YouTube URL
-            "",                  # Cloudinary URL (empty on error)
-            "",                  # Title (empty)
-            "",                  # Description (empty)
-            "",                  # Thumbnail (empty)
-            "",                  # Tags (empty)
-            "",                  # Instagram Caption (empty)
-            "",                  # Published At (IG) (empty)
-            "",                  # Creation ID (empty)
-            str(e)               # Error message
+            video_url,  # YouTube URL
+            "",  # Cloudinary URL (empty on error)
+            "",  # Title (empty)
+            "",  # Description (empty)
+            "",  # Thumbnail (empty)
+            "",  # Tags (empty)
+            "",  # Instagram Caption (empty)
+            "",  # Published At (IG) (empty)
+            "",  # Creation ID (empty)
+            str(e)  # Error message
         ])
         try:
             if temp_filename and os.path.exists(temp_filename):
                 os.remove(temp_filename)
+            if fixed_filename and os.path.exists(fixed_filename):
+                os.remove(fixed_filename)
         except Exception:
             pass
         return {"error": str(e)}
-
 # === Periodic Scheduler ===
 def fetch_new_videos():
     log_event(logging.INFO, "AUTO", "Starting periodic fetch cycle")
