@@ -5,6 +5,8 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from datetime import datetime
 import yt_dlp
+from dotenv import load_dotenv
+load_dotenv()
 
 app = FastAPI()
 
@@ -128,3 +130,8 @@ async def process_video(request: Request):
 
     except Exception as e:
         return {"error": str(e)}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
