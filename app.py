@@ -65,10 +65,8 @@ def validate_cookies_file():
                 log_event(logging.WARNING, "COOKIES", "Cookies file is empty")
                 return False
             
-            # Check if it's Netscape format (starts with comment or has tab-separated values)
             lines = [l for l in content.split('\n') if l.strip() and not l.startswith('#')]
             if lines:
-                # Should have tab-separated values
                 first_line = lines[0]
                 if '\t' not in first_line:
                     log_event(logging.ERROR, "COOKIES", "Cookies file is not in Netscape format (no tabs found)")
@@ -141,7 +139,6 @@ def process_video(video_url: str, category: str = "manual"):
     save_dir = os.path.join(VIDEO_ROOT, category)
     os.makedirs(save_dir, exist_ok=True)
 
-    # Validate cookies before processing
     has_cookies = validate_cookies_file()
 
     try:
@@ -168,16 +165,24 @@ def process_video(video_url: str, category: str = "manual"):
         if duration > 65:
             raise RuntimeError(f"Video too long ({duration}s) — not a Short")
 
-        # --- Download Video using yt-dlp Python API (more reliable) ---
+        # --- Download Video with retries and better error handling ---
         out_template = os.path.join(save_dir, f"{video_id}.%(ext)s")
         log_event(logging.INFO, "DOWNLOAD", f"Downloading {video_id} ({title})")
 
         download_opts = {
-            "format": "bestvideo+bestaudio/best",
+            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
             "merge_output_format": "mp4",
             "outtmpl": out_template,
             "quiet": False,
             "no_warnings": False,
+            "retries": 10,
+            "fragment_retries": 10,
+            "skip_unavailable_fragments": True,
+            "keepvideo": False,
+            "http_chunk_size": 10485760,  # 10MB chunks for better stability
+            "extractor_retries": 3,
+            "file_access_retries": 3,
+            "concurrent_fragment_downloads": 1,  # Avoid overwhelming network
         }
         if has_cookies:
             download_opts["cookiefile"] = COOKIES_PATH
@@ -194,7 +199,12 @@ def process_video(video_url: str, category: str = "manual"):
 
         # --- Upload to Cloudinary ---
         log_event(logging.INFO, "UPLOAD", f"Uploading file {temp_filename} to Cloudinary")
-        upload_result = cloudinary.uploader.upload(temp_filename, resource_type="video")
+        upload_result = cloudinary.uploader.upload(
+            temp_filename,
+            resource_type="video",
+            timeout=300,  # 5 minute timeout for large files
+            chunk_size=6000000  # 6MB chunks
+        )
         cloud_url = upload_result.get("secure_url")
 
         # --- Cleanup ---
@@ -211,7 +221,7 @@ def process_video(video_url: str, category: str = "manual"):
             published_at, "", ""
         ]
         append_row(category, row)
-        log_event(logging.INFO, "UPLOAD", f"Success: {title} → {cloud_url}")
+        log_event(logging.INFO, "SUCCESS", f"{title} → {cloud_url}")
         return {"status": "success", "url": cloud_url}
 
     except Exception as e:
@@ -239,11 +249,11 @@ def fetch_new_videos():
         for channel in channels:
             log_event(logging.INFO, "AUTO", f"Checking channel {channel} ({category})")
             try:
-                # Use yt-dlp Python API instead of subprocess for consistency
                 ydl_opts = {
                     "extract_flat": "in_playlist",
                     "playlistend": 5,
                     "quiet": True,
+                    "extractor_retries": 3,
                 }
                 if has_cookies:
                     ydl_opts["cookiefile"] = COOKIES_PATH
@@ -278,7 +288,7 @@ def fetch_new_videos():
                     if url not in existing_urls:
                         log_event(logging.INFO, "AUTO", f"New video found: {url}")
                         process_video(url, category)
-                        time.sleep(3)
+                        time.sleep(5)  # Increased delay between videos
                     else:
                         log_event(logging.DEBUG, "AUTO", f"Already logged: {url}")
                         
@@ -288,10 +298,15 @@ def fetch_new_videos():
     log_event(logging.INFO, "AUTO", "Periodic fetch cycle complete")
 
 # === Scheduler Thread ===
-def run_scheduler():
-    log_event(logging.INFO, "SCHEDULER", "Starting scheduler thread")
+scheduler_started = False
 
-    # Validate cookies on startup
+def run_scheduler():
+    global scheduler_started
+    if scheduler_started:
+        return
+    scheduler_started = True
+    
+    log_event(logging.INFO, "SCHEDULER", "Starting scheduler thread")
     validate_cookies_file()
 
     # initial run at startup
@@ -305,9 +320,6 @@ def run_scheduler():
     while True:
         schedule.run_pending()
         time.sleep(60)
-
-# start scheduler thread
-threading.Thread(target=run_scheduler, daemon=True).start()
 
 # === FastAPI Routes ===
 @app.get("/")
@@ -327,6 +339,11 @@ def check_cookies():
     """Endpoint to validate cookies file format"""
     is_valid = validate_cookies_file()
     return {"valid": is_valid, "path": COOKIES_PATH}
+
+@app.on_event("startup")
+async def startup_event():
+    """Start scheduler on FastAPI startup"""
+    threading.Thread(target=run_scheduler, daemon=True).start()
 
 if __name__ == "__main__":
     import uvicorn
