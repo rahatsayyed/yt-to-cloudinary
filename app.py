@@ -52,6 +52,34 @@ VIDEO_ROOT = "./videos"
 def log_event(level, context, message):
     log.log(level, f"[{context}] {message}")
 
+def validate_cookies_file():
+    """Validate that cookies file exists and has proper format."""
+    if not os.path.exists(COOKIES_PATH):
+        log_event(logging.WARNING, "COOKIES", f"Cookies file not found at {COOKIES_PATH}")
+        return False
+    
+    try:
+        with open(COOKIES_PATH, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+            if not content:
+                log_event(logging.WARNING, "COOKIES", "Cookies file is empty")
+                return False
+            
+            # Check if it's Netscape format (starts with comment or has tab-separated values)
+            lines = [l for l in content.split('\n') if l.strip() and not l.startswith('#')]
+            if lines:
+                # Should have tab-separated values
+                first_line = lines[0]
+                if '\t' not in first_line:
+                    log_event(logging.ERROR, "COOKIES", "Cookies file is not in Netscape format (no tabs found)")
+                    return False
+        
+        log_event(logging.INFO, "COOKIES", f"Cookies file validated at {COOKIES_PATH}")
+        return True
+    except Exception as e:
+        log_event(logging.ERROR, "COOKIES", f"Error reading cookies file: {e}")
+        return False
+
 def ensure_sheet_exists(sheet_name):
     """Ensure tab exists and header row is set."""
     try:
@@ -113,10 +141,16 @@ def process_video(video_url: str, category: str = "manual"):
     save_dir = os.path.join(VIDEO_ROOT, category)
     os.makedirs(save_dir, exist_ok=True)
 
+    # Validate cookies before processing
+    has_cookies = validate_cookies_file()
+
     try:
         # --- Extract metadata ---
-        ydl_opts = {"quiet": True}
-        if os.path.exists(COOKIES_PATH):
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+        }
+        if has_cookies:
             ydl_opts["cookiefile"] = COOKIES_PATH
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -134,21 +168,22 @@ def process_video(video_url: str, category: str = "manual"):
         if duration > 65:
             raise RuntimeError(f"Video too long ({duration}s) — not a Short")
 
-        # --- Download Video ---
+        # --- Download Video using yt-dlp Python API (more reliable) ---
         out_template = os.path.join(save_dir, f"{video_id}.%(ext)s")
-        log_event(logging.INFO, "DOWNLOAD", f"Downloading {video_id} ({title}) to {out_template}")
+        log_event(logging.INFO, "DOWNLOAD", f"Downloading {video_id} ({title})")
 
-        cmd = [
-            "yt-dlp",
-            "-f", "bestvideo+bestaudio",
-            "--merge-output-format", "mp4",
-            "-o", out_template
-        ]
-        if os.path.exists(COOKIES_PATH):
-            cmd += ["--cookies", COOKIES_PATH]
-        cmd.append(video_url)
+        download_opts = {
+            "format": "bestvideo+bestaudio/best",
+            "merge_output_format": "mp4",
+            "outtmpl": out_template,
+            "quiet": False,
+            "no_warnings": False,
+        }
+        if has_cookies:
+            download_opts["cookiefile"] = COOKIES_PATH
 
-        subprocess.run(cmd, check=True)
+        with yt_dlp.YoutubeDL(download_opts) as ydl:
+            ydl.download([video_url])
 
         # --- Find the downloaded file ---
         possible = [f for f in os.listdir(save_dir) if f.startswith(video_id + ".")]
@@ -195,6 +230,8 @@ def process_video(video_url: str, category: str = "manual"):
 # === Periodic Scheduler ===
 def fetch_new_videos():
     log_event(logging.INFO, "AUTO", "Starting periodic fetch cycle")
+    has_cookies = validate_cookies_file()
+    
     for category, channels in CHANNELS.items():
         ensure_sheet_exists(category)
         existing_urls = get_existing_urls(category)
@@ -202,16 +239,39 @@ def fetch_new_videos():
         for channel in channels:
             log_event(logging.INFO, "AUTO", f"Checking channel {channel} ({category})")
             try:
-                cmd = [
-                    "yt-dlp",
-                    f"https://www.youtube.com/channel/{channel}",
-                    "--flat-playlist", "--get-id", "--playlist-end", "5"
-                ]
-                if os.path.exists(COOKIES_PATH):
-                    cmd += ["--cookies", COOKIES_PATH]
+                # Use yt-dlp Python API instead of subprocess for consistency
+                ydl_opts = {
+                    "extract_flat": "in_playlist",
+                    "playlistend": 5,
+                    "quiet": True,
+                }
+                if has_cookies:
+                    ydl_opts["cookiefile"] = COOKIES_PATH
 
-                output = subprocess.check_output(cmd, text=True)
-                video_ids = [v.strip() for v in output.splitlines() if v.strip()]
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    # Try different channel URL formats
+                    channel_urls = [
+                        f"https://www.youtube.com/@{channel}/shorts",
+                        f"https://www.youtube.com/channel/{channel}/shorts",
+                        f"https://www.youtube.com/@{channel}",
+                        f"https://www.youtube.com/channel/{channel}",
+                    ]
+                    
+                    playlist_info = None
+                    for channel_url in channel_urls:
+                        try:
+                            playlist_info = ydl.extract_info(channel_url, download=False)
+                            if playlist_info:
+                                break
+                        except Exception:
+                            continue
+                    
+                    if not playlist_info:
+                        log_event(logging.WARNING, "AUTO", f"Could not fetch playlist for {channel}")
+                        continue
+
+                    entries = playlist_info.get("entries", [])
+                    video_ids = [e.get("id") for e in entries if e.get("id")][:5]
 
                 for vid in video_ids:
                     url = f"https://www.youtube.com/watch?v={vid}"
@@ -221,6 +281,7 @@ def fetch_new_videos():
                         time.sleep(3)
                     else:
                         log_event(logging.DEBUG, "AUTO", f"Already logged: {url}")
+                        
             except Exception as e:
                 log_event(logging.ERROR, "AUTO", f"Failed fetching from {channel}: {e}")
 
@@ -229,6 +290,9 @@ def fetch_new_videos():
 # === Scheduler Thread ===
 def run_scheduler():
     log_event(logging.INFO, "SCHEDULER", "Starting scheduler thread")
+
+    # Validate cookies on startup
+    validate_cookies_file()
 
     # initial run at startup
     log_event(logging.INFO, "SCHEDULER", "Initial run triggered at startup")
@@ -257,6 +321,12 @@ def manual_process(url: str):
     result = process_video(video_url, "manual")
     log_event(logging.INFO, "MANUAL", f"Manual processing done for {video_url}")
     return result
+
+@app.get("/validate-cookies")
+def check_cookies():
+    """Endpoint to validate cookies file format"""
+    is_valid = validate_cookies_file()
+    return {"valid": is_valid, "path": COOKIES_PATH}
 
 if __name__ == "__main__":
     import uvicorn
